@@ -93,6 +93,11 @@ type AuthNotice = {
   message: string
 }
 
+type AuthUser = {
+  id: string
+  email: string
+}
+
 type Status = 'idle' | 'processing' | 'ready' | 'error'
 
 type AppView = 'studio' | 'community' | 'login' | 'contact'
@@ -729,12 +734,16 @@ function App() {
   const [authConfirmPassword, setAuthConfirmPassword] = useState('')
   const [authNotice, setAuthNotice] = useState<AuthNotice>({ type: 'idle', message: '' })
   const [authLocked, setAuthLocked] = useState(false)
+  const [authSubmitting, setAuthSubmitting] = useState(false)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null)
   const [contactName, setContactName] = useState('')
   const [contactBrand, setContactBrand] = useState('')
   const [contactReplyEmail, setContactReplyEmail] = useState('')
   const [contactMessage, setContactMessage] = useState('')
   const [contactNotice, setContactNotice] = useState<AuthNotice>({ type: 'idle', message: '' })
   const [contactSubmitting, setContactSubmitting] = useState(false)
+  const [csrfToken, setCsrfToken] = useState('')
   const [status, setStatus] = useState<Status>('idle')
   const [errorMessage, setErrorMessage] = useState('')
   const appRef = useRef<HTMLElement>(null)
@@ -905,6 +914,64 @@ function App() {
   }, [])
 
   useEffect(() => {
+    let cancelled = false
+
+    const bootstrap = async () => {
+      try {
+        const bootstrapResponse = await fetch('/api/bootstrap', {
+          method: 'GET',
+          credentials: 'include',
+        })
+
+        if (!bootstrapResponse.ok) {
+          throw new Error('BOOTSTRAP_FAILED')
+        }
+
+        const bootstrapData = await bootstrapResponse.json() as { csrfToken?: string }
+        if (!bootstrapData.csrfToken) {
+          throw new Error('TOKEN_MISSING')
+        }
+
+        if (!cancelled) {
+          setCsrfToken(bootstrapData.csrfToken)
+        }
+
+        const sessionResponse = await fetch('/api/session', {
+          method: 'GET',
+          credentials: 'include',
+        })
+
+        if (!sessionResponse.ok) {
+          if (!cancelled) {
+            setCurrentUser(null)
+          }
+          return
+        }
+
+        const sessionData = await sessionResponse.json() as { user?: AuthUser }
+        if (!cancelled) {
+          setCurrentUser(sessionData.user ?? null)
+        }
+      } catch {
+        if (!cancelled) {
+          setCsrfToken('')
+          setCurrentUser(null)
+        }
+      } finally {
+        if (!cancelled) {
+          setAuthLoading(false)
+        }
+      }
+    }
+
+    bootstrap()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
     if (view !== 'community' || communityConversionStartedRef.current) return
 
     communityConversionStartedRef.current = true
@@ -1068,6 +1135,37 @@ function App() {
     requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'smooth' }))
   }, [])
 
+  const handleLogout = useCallback(async () => {
+    if (!csrfToken) {
+      setAuthNotice({ type: 'error', message: '安全令牌初始化失败，请刷新页面后重试。' })
+      return
+    }
+
+    try {
+      const response = await fetch('/api/logout', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'x-csrf-token': csrfToken,
+        },
+      })
+      const data = await response.json() as { message?: string }
+
+      if (!response.ok) {
+        setAuthNotice({ type: 'error', message: data.message ?? '退出登录失败，请稍后重试。' })
+        return
+      }
+
+      setCurrentUser(null)
+      setAuthPassword('')
+      setAuthConfirmPassword('')
+      setAuthNotice({ type: 'success', message: data.message ?? '已退出登录。' })
+      setAuthMode('login')
+    } catch {
+      setAuthNotice({ type: 'error', message: '无法连接后端接口，请稍后重试。' })
+    }
+  }, [csrfToken])
+
   const downloadCommunityPattern = useCallback(async (
     pattern: CommunityPattern,
     result: ConversionResult | undefined,
@@ -1089,6 +1187,11 @@ function App() {
     const now = Date.now()
     if (authLocked) {
       setAuthNotice({ type: 'error', message: '提交过于频繁，请稍后再试。' })
+      return
+    }
+
+    if (!csrfToken) {
+      setAuthNotice({ type: 'error', message: '安全令牌初始化失败，请刷新页面后重试。' })
       return
     }
 
@@ -1130,10 +1233,15 @@ function App() {
       return
     }
 
+    setAuthSubmitting(true)
     try {
       const response = await fetch('/api/auth', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'content-type': 'application/json',
+          'x-csrf-token': csrfToken,
+        },
         body: JSON.stringify({
           mode: authMode,
           email,
@@ -1141,22 +1249,27 @@ function App() {
           confirmPassword,
         }),
       })
-      const data = await response.json() as { message?: string }
+      const data = await response.json() as { message?: string; user?: AuthUser }
 
       if (!response.ok) {
         setAuthNotice({ type: 'error', message: data.message ?? '认证请求失败，请稍后重试。' })
         return
       }
 
+      setCurrentUser(data.user ?? null)
       setAuthEmail(email)
+      setAuthPassword('')
+      setAuthConfirmPassword('')
       setAuthNotice({
         type: 'success',
-        message: data.message ?? (authMode === 'register' ? '注册信息已通过后端校验。' : '登录信息已通过后端校验。'),
+        message: data.message ?? (authMode === 'register' ? '注册成功，已自动登录。' : '登录成功。'),
       })
     } catch {
       setAuthNotice({ type: 'error', message: '无法连接后端接口，请检查 Vercel API 或本地服务。' })
+    } finally {
+      setAuthSubmitting(false)
     }
-  }, [authConfirmPassword, authEmail, authLocked, authMode, authPassword])
+  }, [authConfirmPassword, authEmail, authLocked, authMode, authPassword, csrfToken])
 
   const handleContactSubmit = useCallback(async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -1176,11 +1289,20 @@ function App() {
       return
     }
 
+    if (!csrfToken) {
+      setContactNotice({ type: 'error', message: '安全令牌初始化失败，请刷新页面后重试。' })
+      return
+    }
+
     setContactSubmitting(true)
     try {
       const response = await fetch('/api/contact', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'content-type': 'application/json',
+          'x-csrf-token': csrfToken,
+        },
         body: JSON.stringify({ name, brand, email, message }),
       })
       const data = await response.json() as { message?: string; salesEmail?: string }
@@ -1203,7 +1325,7 @@ function App() {
     } finally {
       setContactSubmitting(false)
     }
-  }, [contactBrand, contactMessage, contactName, contactReplyEmail])
+  }, [contactBrand, contactMessage, contactName, contactReplyEmail, csrfToken])
 
   return (
     <main className={view === 'studio' ? 'app-shell' : 'app-shell app-shell-simple'} ref={appRef}>
@@ -1235,7 +1357,7 @@ function App() {
             </button>
             <button className={view === 'login' ? 'is-active' : ''} type="button" onClick={openLogin}>
               <UserRound size={16} />
-              登录
+              {currentUser ? '账户' : '登录'}
             </button>
             <button className={view === 'contact' ? 'is-active' : ''} type="button" onClick={openContact}>
               <Mail size={16} />
@@ -1526,116 +1648,149 @@ function App() {
               <p className="eyebrow">Member account</p>
               <h1 id="page-title">{authMode === 'register' ? '注册后发布图纸和管理下载。' : '登录后保存图纸和发布作品。'}</h1>
               <p>
-                当前为前端模拟账户流程，注册不会创建真实账户；已加入邮箱格式校验、输入清洗和提交频率限制，真实抗 DoS、DDoS 和 SQL 注入仍需后端、数据库参数化查询、CDN 与 WAF 配合。
+                创建账户后可以管理发布内容、保存常用图纸设置，并在不同设备上继续使用你的工作台。
               </p>
               <div className="login-highlights">
                 <span>
                   <ShieldCheck size={18} />
-                  频率限制
+                  服务端限流
                 </span>
                 <span>
                   <Users size={18} />
-                  邮箱校验
+                  会话恢复
                 </span>
                 <span>
                   <Download size={18} />
-                  输入清洗
+                  参数化查询
                 </span>
               </div>
             </div>
 
-            <form className="glass-panel login-card" onSubmit={handleAuthSubmit}>
-              <div className="login-card-header">
-                <span className="brand-mark">
-                  <LogIn size={18} />
-                </span>
-                <div>
-                  <p>PixelBeads Account</p>
-                  <h2>{authMode === 'register' ? '创建账户' : '欢迎回来'}</h2>
+            {currentUser ? (
+              <div className="glass-panel login-card account-card">
+                <div className="login-card-header">
+                  <span className="brand-mark">
+                    <UserRound size={18} />
+                  </span>
+                  <div>
+                    <p>PixelBeads Account</p>
+                    <h2>已登录</h2>
+                  </div>
                 </div>
-              </div>
-              <div className="auth-mode-toggle" aria-label="登录或注册">
-                <button
-                  className={authMode === 'login' ? 'is-active' : ''}
-                  type="button"
-                  onClick={() => {
-                    setAuthMode('login')
-                    setAuthNotice({ type: 'idle', message: '' })
-                  }}
-                >
-                  登录
+                <div className="account-details">
+                  <div>
+                    <span>当前邮箱</span>
+                    <strong>{currentUser.email}</strong>
+                  </div>
+                  <div>
+                    <span>账户 ID</span>
+                    <strong>{currentUser.id}</strong>
+                  </div>
+                </div>
+                {authNotice.message ? (
+                  <p className={`auth-notice auth-${authNotice.type}`}>{authNotice.message}</p>
+                ) : null}
+                <button type="button" onClick={handleLogout}>
+                  退出登录
                 </button>
-                <button
-                  className={authMode === 'register' ? 'is-active' : ''}
-                  type="button"
-                  onClick={() => {
-                    setAuthMode('register')
-                    setAuthNotice({ type: 'idle', message: '' })
-                  }}
-                >
-                  注册
-                </button>
+                <p>
+                  当前会话保存在 HttpOnly Cookie 中，刷新页面后会自动恢复。部署到 Vercel 前，请先配置数据库和 `AUTH_SECRET`。
+                </p>
               </div>
-              <label>
-                <span>邮箱</span>
-                <div className="input-shell">
-                  <Mail size={18} />
-                  <input
-                    autoComplete="email"
-                    inputMode="email"
-                    maxLength={120}
-                    onChange={(event) => setAuthEmail(sanitizeAuthInput(event.target.value))}
-                    placeholder="you@example.com"
-                    required
-                    type="email"
-                    value={authEmail}
-                  />
+            ) : (
+              <form className="glass-panel login-card" onSubmit={handleAuthSubmit}>
+                <div className="login-card-header">
+                  <span className="brand-mark">
+                    <LogIn size={18} />
+                  </span>
+                  <div>
+                    <p>PixelBeads Account</p>
+                    <h2>{authLoading ? '正在恢复会话' : authMode === 'register' ? '创建账户' : '欢迎回来'}</h2>
+                  </div>
                 </div>
-              </label>
-              <label>
-                <span>密码</span>
-                <div className="input-shell">
-                  <ShieldCheck size={18} />
-                  <input
-                    autoComplete={authMode === 'register' ? 'new-password' : 'current-password'}
-                    maxLength={128}
-                    minLength={8}
-                    onChange={(event) => setAuthPassword(event.target.value)}
-                    placeholder="至少 8 位"
-                    required
-                    type="password"
-                    value={authPassword}
-                  />
+                <div className="auth-mode-toggle" aria-label="登录或注册">
+                  <button
+                    className={authMode === 'login' ? 'is-active' : ''}
+                    type="button"
+                    onClick={() => {
+                      setAuthMode('login')
+                      setAuthNotice({ type: 'idle', message: '' })
+                    }}
+                  >
+                    登录
+                  </button>
+                  <button
+                    className={authMode === 'register' ? 'is-active' : ''}
+                    type="button"
+                    onClick={() => {
+                      setAuthMode('register')
+                      setAuthNotice({ type: 'idle', message: '' })
+                    }}
+                  >
+                    注册
+                  </button>
                 </div>
-              </label>
-              {authMode === 'register' ? (
                 <label>
-                  <span>确认密码</span>
+                  <span>邮箱</span>
                   <div className="input-shell">
-                    <ShieldCheck size={18} />
+                    <Mail size={18} />
                     <input
-                      autoComplete="new-password"
-                      maxLength={128}
-                      minLength={8}
-                      onChange={(event) => setAuthConfirmPassword(event.target.value)}
-                      placeholder="再次输入密码"
+                      autoComplete="email"
+                      inputMode="email"
+                      maxLength={120}
+                      onChange={(event) => setAuthEmail(sanitizeAuthInput(event.target.value))}
+                      placeholder="you@example.com"
                       required
-                      type="password"
-                      value={authConfirmPassword}
+                      type="email"
+                      value={authEmail}
                     />
                   </div>
                 </label>
-              ) : null}
-              {authNotice.message ? (
-                <p className={`auth-notice auth-${authNotice.type}`}>{authNotice.message}</p>
-              ) : null}
-              <button type="submit" disabled={authLocked}>
-                {authMode === 'register' ? '注册' : '登录'}
-              </button>
-              <p>
-                前端限制只能减少误操作和低频滥用；上线时必须在后端做限流、验证码、密码哈希、参数化查询、CSRF 防护、日志审计和 WAF/CDN 防护。
-              </p>
-            </form>
+                <label>
+                  <span>密码</span>
+                  <div className="input-shell">
+                    <ShieldCheck size={18} />
+                    <input
+                      autoComplete={authMode === 'register' ? 'new-password' : 'current-password'}
+                      maxLength={128}
+                      minLength={8}
+                      onChange={(event) => setAuthPassword(event.target.value)}
+                      placeholder="至少 8 位"
+                      required
+                      type="password"
+                      value={authPassword}
+                    />
+                  </div>
+                </label>
+                {authMode === 'register' ? (
+                  <label>
+                    <span>确认密码</span>
+                    <div className="input-shell">
+                      <ShieldCheck size={18} />
+                      <input
+                        autoComplete="new-password"
+                        maxLength={128}
+                        minLength={8}
+                        onChange={(event) => setAuthConfirmPassword(event.target.value)}
+                        placeholder="再次输入密码"
+                        required
+                        type="password"
+                        value={authConfirmPassword}
+                      />
+                    </div>
+                  </label>
+                ) : null}
+                {authNotice.message ? (
+                  <p className={`auth-notice auth-${authNotice.type}`}>{authNotice.message}</p>
+                ) : null}
+                <button type="submit" disabled={authLocked || authSubmitting || authLoading}>
+                  {authSubmitting ? '提交中' : authMode === 'register' ? '注册' : '登录'}
+                </button>
+                <p>
+                  登录后可继续管理你的图纸、下载记录和社区发布内容。
+                </p>
+              </form>
+            )}
           </section>
         ) : null}
         {view === 'contact' ? (
